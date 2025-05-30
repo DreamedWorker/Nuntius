@@ -1,0 +1,9 @@
+commands:
+  获取指纹:
+    description: "更新虚拟设备的指纹" # 命令简介
+    handler: "icu.bluedream.nuntius.genshin.util.FingerprintCommand" # 处理命令的类
+    master: 1 # 只允许主人调用 为0则都可调用
+  绑定uid:
+    description: "创建基于qq号的uid映射"
+    handler: "icu.bluedream.nuntius.genshin.impl.account.AccountCommand"
+    master: 0
