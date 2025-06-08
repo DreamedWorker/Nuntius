@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<Commands>
+    <Command
+            name="绑定uid"
+            master="0"
+            handler="icu.bluedream.nuntius.genshin.commands.uid.BindingUidCommand"
+            description="创建基于qq号的uid映射"
+    />
+    <Command
+            name="解绑uid"
+            master="0"
+            handler="icu.bluedream.nuntius.genshin.commands.uid.RemoveUidCommand"
+            description="删除基于qq号的uid映射"
+    />
+    <Command
+            name="更新指纹"
+            master="1"
+            handler="icu.bluedream.nuntius.genshin.commands.FingerprintCommand"
+            description="更新虚拟设备的指纹"
+    />
+</Commands>

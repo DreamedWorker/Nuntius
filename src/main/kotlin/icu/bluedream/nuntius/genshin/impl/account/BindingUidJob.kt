@@ -1,25 +1,21 @@
 package icu.bluedream.nuntius.genshin.impl.account
 
-import icu.bluedream.nuntius.app.config.DeviceEnv
-import icu.bluedream.nuntius.app.db.DatabaseHelper
+import icu.bluedream.nuntius.app.LocalPath
+import icu.bluedream.nuntius.app.QQMessageClient
+import icu.bluedream.nuntius.app.data.MessageEvent
 import icu.bluedream.nuntius.app.extension.file.img2base64
-import icu.bluedream.nuntius.app.extension.request.setDS
-import icu.bluedream.nuntius.app.extension.request.setUser
-import icu.bluedream.nuntius.app.util.LocalPath
-import icu.bluedream.nuntius.app.web.buildPostRequest
-import icu.bluedream.nuntius.app.web.buildRequest
-import icu.bluedream.nuntius.app.web.defaultHoyoClient
-import icu.bluedream.nuntius.app.web.getAsStruct
-import icu.bluedream.nuntius.app.web.toRequestBody
-import icu.bluedream.nuntius.cq.NTMessageSender
-import icu.bluedream.nuntius.genshin.ApiEndpoints
-import icu.bluedream.nuntius.genshin.impl.account.func.getCookieToken
-import icu.bluedream.nuntius.genshin.impl.account.func.getSTokenByGameToken
-import icu.bluedream.nuntius.genshin.model.account.GameBasicInfo
-import icu.bluedream.nuntius.genshin.model.account.LToken
-import icu.bluedream.nuntius.genshin.model.account.QRCodeScanResult
-import icu.bluedream.nuntius.genshin.model.account.QRCodeToken
-import icu.bluedream.nuntius.genshin.util.DynamicSecret
+import icu.bluedream.nuntius.genshin.app.database.DatabaseHelper
+import icu.bluedream.nuntius.genshin.app.model.account.GameBasicInfo
+import icu.bluedream.nuntius.genshin.app.model.account.LToken
+import icu.bluedream.nuntius.genshin.app.model.account.QRCodeScanResult
+import icu.bluedream.nuntius.genshin.app.model.account.QRCodeToken
+import icu.bluedream.nuntius.genshin.app.util.DynamicSecret
+import icu.bluedream.nuntius.genshin.app.web.ApiEndpoints
+import icu.bluedream.nuntius.genshin.app.web.HoyoWebClient
+import icu.bluedream.nuntius.genshin.impl.DeviceEnv
+import io.ktor.client.call.*
+import io.ktor.client.request.*
+import io.ktor.http.*
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -37,10 +33,10 @@ typealias LoginPreload = MutableMap<String, String>
 
 object BindingUidJob {
     @Throws(LoginException::class)
-    suspend fun bindingUid(group: String, sender: String) {
-        if (canInsert(sender)) {
+    suspend fun bindingUid(msgBody: MessageEvent) {
+        if (canInsert(msgBody.sender.userId.toString())) {
             val code = generateQRCode()
-            val msgQRResult = NTMessageSender.sendImageMessage(code["codeFile"]!!.img2base64(), group)
+            val msgQRResult = QQMessageClient.sendImageMessage(code["codeFile"]!!.img2base64(), msgBody)
             if (msgQRResult.retcode == 0) {
                 val ticket = parseQueryString(code["codeURL"]!!)["ticket"]
                 if (ticket == null) {
@@ -67,7 +63,7 @@ object BindingUidJob {
                                 )
                             }.await()
                             val account = HoyoAccountEntity(
-                                qqCode = sender,
+                                qqCode = msgBody.sender.userId.toString(),
                                 cookieToken = ckToken.data.cookieToken,
                                 gameToken = tokens.token,
                                 ltoken = lToken,
@@ -83,16 +79,16 @@ object BindingUidJob {
                             )
                             if (DatabaseHelper.insertHoyoAccount(account)) {
                                 val msgResult = async {
-                                    NTMessageSender.sendTextMessage(
-                                        "我们已为「${sender}」绑定了UID：${gameInfo.gameUid}",
-                                        group
+                                    QQMessageClient.sendTextMessage(
+                                        "我们已为「${msgBody.sender.userId}」绑定了UID：${gameInfo.gameUid}",
+                                        msgBody
                                     )
                                 }.await()
                                 if (msgResult.retcode == 0) {
                                     delay(5.seconds)
-                                    NTMessageSender.deleteMessage(msgResult.data?.id.toString())
+                                    QQMessageClient.deleteMessage(msgResult.data?.id.toString())
                                     delay(1.seconds)
-                                    NTMessageSender.deleteMessage(msgQRResult.data?.id.toString())
+                                    QQMessageClient.deleteMessage(msgQRResult.data?.id.toString())
                                     LocalPath.deleteFile(code["codeFile"] as String)
                                 }
                             } else {
@@ -101,11 +97,11 @@ object BindingUidJob {
                         }
                     },
                     onFailedOrExpired = { msg ->
-                        throw LoginException("我们终止了${sender}的本次登录，${msg}")
+                        throw LoginException("我们终止了${msgBody.sender.userId}的本次登录，${msg}")
                     }
                 )
             } else {
-                throw LoginException("我们无法发送登录用二维码到群：${group}")
+                throw LoginException("我们无法发送登录用二维码")
             }
         } else {
             throw LoginException("此QQ号已经绑定过UID了！")
@@ -124,13 +120,14 @@ object BindingUidJob {
             put("app_id", "2")
             put("device", DeviceEnv.deviceId)
             put("ticket", ticket)
-            toString().toRequestBody()
+            toString()
         }
         while (retryCount < maxRetries) {
-            val result = buildPostRequest(
-                { url(ApiEndpoints.getQRQuery()) },
-                requestBody
-            ).getAsStruct<QRCodeScanResult>(defaultHoyoClient)
+            val request = HoyoWebClient.hoyoClient.post(ApiEndpoints.getQRQuery()) {
+                contentType(ContentType.Application.Json)
+                setBody(requestBody)
+            }
+            val result = request.body<QRCodeScanResult>()
             if (result.retcode != 0L) {
                 onFailedOrExpired("此二维码已过期")
                 break
@@ -140,6 +137,19 @@ object BindingUidJob {
                 onScanned(Json.decodeFromString<QRCodeToken>(raw))
                 break
             }
+//            val result = buildPostRequest(
+//                { url(ApiEndpoints.getQRQuery()) },
+//                requestBody
+//            ).getAsStruct<QRCodeScanResult>(defaultHoyoClient)
+//            if (result.retcode != 0L) {
+//                onFailedOrExpired("此二维码已过期")
+//                break
+//            }
+//            if (result.data.stat == "Confirmed") {
+//                val raw = result.data.payload.raw
+//                onScanned(Json.decodeFromString<QRCodeToken>(raw))
+//                break
+//            }
             retryCount++
             delay(interval.seconds)
         }
@@ -151,15 +161,23 @@ object BindingUidJob {
         stoken: String,
         mid: String
     ): GameBasicInfo.GameBasicInfoClass.GameBasic {
-        val result = buildRequest {
-            url(ApiEndpoints.getGameBasic())
-            setUser(uid, stoken, mid)
-            setDS(DynamicSecret.Version.Gen1, DynamicSecret.SaltType.K2)
-            addHeader("Host", "api-takumi.miyoushe.com")
-            addHeader("Referer", "https://app.mihoyo.com")
-            addHeader("Origin", "https://api-takumi.miyoushe.com")
-            addHeader("X-Requested-With", "com.mihoyo.hyperion")
-        }.getAsStruct<GameBasicInfo>(defaultHoyoClient)
+        val result = HoyoWebClient.hoyoClient.get(ApiEndpoints.getGameBasic()) {
+            header("cookie", "stuid=${uid};stoken=${stoken};mid=${mid}")
+            header("DS", DynamicSecret.getDynamicSecret(DynamicSecret.Version.Gen1, DynamicSecret.SaltType.K2))
+            header("Host", "api-takumi.miyoushe.com")
+            header("Referer", "https://app.mihoyo.com")
+            header("Origin", "https://api-takumi.miyoushe.com")
+            header("X-Requested-With", "com.mihoyo.hyperion")
+        }.body<GameBasicInfo>()
+//        val result = buildRequest {
+//            url(ApiEndpoints.getGameBasic())
+//            setUser(uid, stoken, mid)
+//            setDS(DynamicSecret.Version.Gen1, DynamicSecret.SaltType.K2)
+//            addHeader("Host", "api-takumi.miyoushe.com")
+//            addHeader("Referer", "https://app.mihoyo.com")
+//            addHeader("Origin", "https://api-takumi.miyoushe.com")
+//            addHeader("X-Requested-With", "com.mihoyo.hyperion")
+//        }.getAsStruct<GameBasicInfo>(defaultHoyoClient)
         if (result.retcode != 0L) {
             throw LoginException("我们无法获取你的游戏信息：${result.message}")
         }
@@ -172,10 +190,13 @@ object BindingUidJob {
 
     @Throws(LoginException::class)
     private suspend fun fetchLToken(uid: String, stoken: String, mid: String): String {
-        val result = buildRequest {
-            url(ApiEndpoints.getLToken())
-            setUser(uid, stoken, mid)
-        }.getAsStruct<LToken>(defaultHoyoClient)
+        val result = HoyoWebClient.hoyoClient.get(ApiEndpoints.getLToken()) {
+            header("cookie", "stuid=${uid};stoken=${stoken};mid=${mid}")
+        }.body<LToken>()
+//        val result = buildRequest {
+//            url(ApiEndpoints.getLToken())
+//            setUser(uid, stoken, mid)
+//        }.getAsStruct<LToken>(defaultHoyoClient)
         if (result.retcode != 0L) {
             throw LoginException("我们无法获取你的LToken：${result.message}")
         }
@@ -188,14 +209,18 @@ object BindingUidJob {
         val requestBody = with(JSONObject()) {
             put("app_id", "2")
             put("device", DeviceEnv.deviceId)
-            toString().toRequestBody()
+            toString()
         }
-        val result = buildPostRequest(
-            {
-                url(ApiEndpoints.getQRFetch())
-            },
-            requestBody
-        ).getAsStruct<icu.bluedream.nuntius.genshin.model.account.QRCode>(defaultHoyoClient)
+        val result = HoyoWebClient.hoyoClient.post(ApiEndpoints.getQRFetch()) {
+            contentType(ContentType.Application.Json)
+            setBody(requestBody)
+        }.body<icu.bluedream.nuntius.genshin.app.model.account.QRCode>()
+//        val result = buildPostRequest(
+//            {
+//                url(ApiEndpoints.getQRFetch())
+//            },
+//            requestBody
+//        ).getAsStruct<icu.bluedream.nuntius.genshin.app.model.account.QRCode>(defaultHoyoClient)
         if (result.retcode != 0) {
             throw LoginException("无法获取登录用二维码：${result.message}")
         }

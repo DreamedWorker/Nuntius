@@ -1,75 +1,77 @@
 package icu.bluedream.nuntius
 
-import icu.bluedream.nuntius.app.config.BotConfig
-import icu.bluedream.nuntius.app.config.Configuration
-import icu.bluedream.nuntius.app.db.DatabaseHelper
-import icu.bluedream.nuntius.app.util.LocalPath
-import icu.bluedream.nuntius.app.util.SecurityUtil
-import icu.bluedream.nuntius.app.web.WebsocketHelper
+import icu.bluedream.nuntius.app.BotConfig
+import icu.bluedream.nuntius.app.LocalPath
+import icu.bluedream.nuntius.app.SecurityGuard
+import icu.bluedream.nuntius.app.WebsocketClient
+import icu.bluedream.nuntius.app.command.CommandDispatcher
+import icu.bluedream.nuntius.app.command.CommandEntry
+import icu.bluedream.nuntius.app.command.CommandLoader
+import icu.bluedream.nuntius.app.data.MessageEvent
 import icu.bluedream.nuntius.genshin.GenshinEntrypoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withTimeoutOrNull
+import org.dom4j.Element
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
-val LOGGER: Logger = LoggerFactory.getLogger("Nuntius")
+val logger: Logger = LoggerFactory.getLogger("Nuntius")
+val config: Element = BotConfig.readConfig().rootElement
+val userTaskMutexMap = ConcurrentHashMap<Long, Mutex>()
+val loadedCommands: MutableMap<String, CommandEntry> = mutableMapOf()
 
-val config = BotConfig.loadBotConfig() // 读取配置文件
-@Suppress("UNCHECKED_CAST")
-val configOperation = config["operation"] as Map<String, Any>
-@Suppress("UNCHECKED_CAST")
-val configBot = config["bot"] as Map<String, Any>
-@Suppress("UNCHECKED_CAST")
-val configService = config["service"] as Map<String, Any>
-
-suspend fun main() {
+fun main() {
     LocalPath.checkDirs()
-    val userTaskMutexMap = ConcurrentHashMap<Long, Mutex>()
-    LOGGER.info(DatabaseHelper.connection.toString()) // 连接本地数据库
-    // 初始化配置文件管理器
-    LOGGER.info(Configuration.getConfiguration().getValue("deviceFp", ""))
-    // 设置安全组
-    SecurityUtil.createInstance(configService)
-    //// 插件初始化入口
+    val securityGuard = SecurityGuard(config.element("BotService"))
+    logger.info("哇~世界灿烂盛大！")
+    val callingToken = config.element("BotService").element("CallingToken").text
+    loadedCommands.apply {
+        putAll(CommandLoader.loadCommands(
+            Thread.currentThread().contextClassLoader.getResourceAsStream("genshin/commands.xml")!!
+        ))
+    }
     GenshinEntrypoint.beforeStart()
-    // 结束插件初始化
-    LOGGER.info("哇~世界灿烂盛大！")
-    WebsocketHelper.websocketHelper(
-        configBot
-    ) { msg ->
-        if (SecurityUtil.instance.shouldProvideServices(
-                senderID = msg.sender.userId.toString(),
-                groupId = msg.groupId.toString()
-            )) {
-            val userMutex = userTaskMutexMap.computeIfAbsent(msg.sender.userId) { Mutex() }
-            CoroutineScope(Dispatchers.IO).launch {
-                if (!userMutex.tryLock()) {
-                    LOGGER.warn("用户 ${msg.sender.userId} 的任务已在进行中，忽略本次。")
-                    return@launch
-                }
-                try {
-                    val trigger = configOperation["calling_token"] as String
-                    val master = configService["master_qq"] as String
-                    withTimeoutOrNull(TimeUnit.SECONDS.toMillis(300)) {
-                        runBlocking {
-                            val  startTime = System.currentTimeMillis()
-                            val task = async { GenshinEntrypoint.genshinPoint(msg, trigger, master) }
-                            task.await()
-                            val endTime = System.currentTimeMillis()
-                            LOGGER.info("用户 ${msg.sender.userId} 的任务已完成，耗时：${endTime - startTime}")
+    WebsocketClient.connectToServer(
+        webConfig = config.element("BotNetwork"),
+        service = { messageEvent, isPublic ->
+            val textMessage = messageEvent.message.first().data.text
+            if (textMessage.startsWith(callingToken)) {
+                val commandName = textMessage.drop(1)
+                if (loadedCommands.keys.contains(commandName)) {
+                    val cmdEntry = loadedCommands[commandName]!!
+                    if (isPublic) {
+                        if (securityGuard.provideService(messageEvent)) {
+                            startTask(messageEvent, cmdEntry)
                         }
-                    } ?: LOGGER.warn("用户 ${msg.sender.userId} 的本次任务已经超时！")
-                } finally {
-                    userMutex.unlock()
+                    } else {
+                        startTask(messageEvent, cmdEntry)
+                    }
+                } else {
+                    logger.warn("用户呼叫了一个不存在的命令：${textMessage}")
                 }
             }
+        }
+    )
+}
+
+private fun startTask(msg: MessageEvent, entry: CommandEntry) {
+    val userMutex = userTaskMutexMap.computeIfAbsent(msg.sender.userId) { Mutex() }
+    CoroutineScope(Dispatchers.IO).launch {
+        if (!userMutex.tryLock()) {
+            logger.warn("用户 ${msg.sender.userId} 的任务已在进行中，忽略本次。")
+            return@launch
+        }
+        try {
+            withTimeoutOrNull(TimeUnit.SECONDS.toMillis(300)) {
+                CommandDispatcher.dispatch(msg, entry)
+            } ?: logger.warn("用户 ${msg.sender.userId} 的本次任务已经超时！")
+        } finally {
+            userMutex.unlock()
         }
     }
 }
